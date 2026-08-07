@@ -4,9 +4,3 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aya-ebpf = { version = "0.2.1", optional = true }
-
-[features]
-aya-ebpf = ["dep:aya-ebpf"]
-default = []
-user = []
