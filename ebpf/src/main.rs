@@ -10,6 +10,7 @@ use aya_ebpf::{
     macros::{classifier, sock_ops},
     programs::{SockOpsContext, TcContext},
 };
+use aya_log_ebpf::info;
 use fleetos_ebpf_common::{EbpfPolicyKey, FleetosHeader};
 use maps::POLICY_MAP;
 
@@ -26,6 +27,8 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// Ingress Traffic Control (tc) packet classifier program.
 #[classifier]
 pub fn tc_ingress_filter(ctx: TcContext) -> i32 {
+    // Add log statement passing the context
+    info!(&ctx, "eBPF ingress filter evaluating packet");
     match unsafe { try_tc_ingress_filter(&ctx) } {
         Ok(action) => action,
         Err(_) => TC_ACT_SHOT, // Default-deny on parse or bounds check failure

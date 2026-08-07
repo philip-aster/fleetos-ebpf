@@ -54,3 +54,9 @@ pub struct FleetosHeader {
     /// Target Port
     pub port: u16,
 }
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for EbpfPolicyKey {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for EbpfPolicyValue {}
