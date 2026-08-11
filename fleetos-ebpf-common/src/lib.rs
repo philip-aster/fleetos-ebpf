@@ -11,7 +11,7 @@ pub struct IdentityHash {
 
 /// Key used in the `POLICY_MAP` eBPF hash table.
 /// Encapsulates the Source SVID Hash, Target SVID Hash, and Target Port.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EbpfPolicyKey {
     /// 128-bit truncated BLAKE3 fingerprint of calling workload SVID
@@ -25,7 +25,7 @@ pub struct EbpfPolicyKey {
 }
 
 /// Value stored in the `POLICY_MAP` eBPF hash table.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EbpfPolicyValue {
     /// 1 = ALLOW, 0 = DROP
@@ -36,7 +36,7 @@ pub struct EbpfPolicyValue {
 }
 
 /// Network Frame Overlay Header to transit packets
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct FleetosHeader {
     /// Magic identifier (0x464C = "FL")
@@ -60,3 +60,6 @@ unsafe impl aya::Pod for EbpfPolicyKey {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for EbpfPolicyValue {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FleetosHeader {}
