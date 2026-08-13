@@ -13,3 +13,9 @@ name = "ebpf"
 path = "src/main.rs"
 test = false
 bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -4,20 +4,28 @@
 
 /// 128-bit truncated BLAKE3 identity fingerprint (16 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "user", derive(aya::Pod))]
 #[repr(C)]
 pub struct IdentityHash {
     pub bytes: [u8; 16],
 }
 
+impl IdentityHash {
+    pub const fn new(bytes: [u8; 16]) -> Self {
+        Self { bytes }
+    }
+}
+
 /// Key used in the `POLICY_MAP` eBPF hash table.
 /// Encapsulates the Source SVID Hash, Target SVID Hash, and Target Port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "user", derive(aya::Pod))]
 #[repr(C)]
 pub struct EbpfPolicyKey {
     /// 128-bit truncated BLAKE3 fingerprint of calling workload SVID
-    pub src_hash: [u8; 16],
+    pub src_hash: IdentityHash,
     /// 128-bit truncated BLAKE3 fingerprint of destination workload SVID
-    pub dst_hash: [u8; 16],
+    pub dst_hash: IdentityHash,
     /// Destination port (e.g., 5432 for Postgres)
     pub port: u16,
     /// 16-bit explicit padding for 32/64-bit alignment compliance in eBPF maps
@@ -26,6 +34,7 @@ pub struct EbpfPolicyKey {
 
 /// Value stored in the `POLICY_MAP` eBPF hash table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "user", derive(aya::Pod))]
 #[repr(C)]
 pub struct EbpfPolicyValue {
     /// 1 = ALLOW, 0 = DROP
@@ -37,6 +46,7 @@ pub struct EbpfPolicyValue {
 
 /// Network Frame Overlay Header to transit packets
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "user", derive(aya::Pod))]
 #[repr(C)]
 pub struct FleetosHeader {
     /// Magic identifier (0x464C = "FL")
@@ -46,20 +56,11 @@ pub struct FleetosHeader {
     /// Reserved flags
     pub flags: u8,
     /// Source Workload SPIFFE Hash
-    pub src_hash: [u8; 16],
+    pub src_hash: IdentityHash,
     /// Destination Workload SPIFFE Hash
-    pub dst_hash: [u8; 16],
+    pub dst_hash: IdentityHash,
     /// Target Role ID (e.g., 1 = primary, 2 = replica)
     pub role_id: u16,
     /// Target Port
     pub port: u16,
 }
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for EbpfPolicyKey {}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for EbpfPolicyValue {}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for FleetosHeader {}

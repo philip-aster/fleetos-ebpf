@@ -1,12 +1,15 @@
 // xtask/src/main.rs
-use anyhow::Result;
+// Build runner that invokes cargo to compile kernel eBPF bytecode
+
+use anyhow::{Result, bail};
 use std::process::Command;
 
 fn main() -> Result<()> {
     println!("Compiling FleetOS eBPF kernel programs...");
 
     let status = Command::new("cargo")
-        .args(&[
+        .args([
+            "+nightly",
             "build",
             "--package",
             "ebpf",
@@ -19,9 +22,9 @@ fn main() -> Result<()> {
         .status()?;
 
     if !status.success() {
-        anyhow::bail!("eBPF build failed");
+        bail!("eBPF kernel compilation failed");
     }
 
-    println!("eBPF bytecode compiled successfully.");
+    println!("eBPF bytecode compiled successfully to target/bpfel-unknown-none/release/ebpf.");
     Ok(())
 }

@@ -27,7 +27,6 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// Ingress Traffic Control (tc) packet classifier program.
 #[classifier]
 pub fn tc_ingress_filter(ctx: TcContext) -> i32 {
-    // Add log statement passing the context
     info!(&ctx, "eBPF ingress filter evaluating packet");
     match unsafe { try_tc_ingress_filter(&ctx) } {
         Ok(action) => action,
@@ -37,7 +36,7 @@ pub fn tc_ingress_filter(ctx: TcContext) -> i32 {
 
 /// Safely inspect packet data using strict eBPF verifier bounds checking.
 unsafe fn try_tc_ingress_filter(ctx: &TcContext) -> Result<i32, ()> {
-    // 1. Dereference raw skb pointers within explicit unsafe blocks (Rust 2024 compliance)
+    // 1. Dereference raw skb pointers within explicit unsafe blocks
     let data = unsafe { (*ctx.skb.skb).data as usize };
     let data_end = unsafe { (*ctx.skb.skb).data_end as usize };
 
@@ -55,7 +54,7 @@ unsafe fn try_tc_ingress_filter(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    // 5. Construct BPF Map lookup key
+    // 5. Construct BPF Map lookup key using typed IdentityHash fields
     let key = EbpfPolicyKey {
         src_hash: header.src_hash,
         dst_hash: header.dst_hash,
@@ -63,7 +62,7 @@ unsafe fn try_tc_ingress_filter(ctx: &TcContext) -> Result<i32, ()> {
         _pad: 0,
     };
 
-    // 6. Query eBPF Policy Map inside explicit unsafe block
+    // 6. Query eBPF Policy Map
     if let Some(val) = unsafe { POLICY_MAP.get(&key) } {
         if val.action == 1 {
             return Ok(TC_ACT_OK); // ALLOW
