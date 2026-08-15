@@ -1,17 +1,19 @@
 [workspace]
+resolver = "2"
 members = [
     "fleetos-ebpf-common",
-    "ebpf",
-    "xtask",
+    "fleetos-ebpf",
 ]
-resolver = "2"
+
+[workspace.dependencies]
+# Assuming fleetos-core is checked out as a sibling directory
+fleetos-core = { version = "0.1.0", path = "../fleetos-core", default-features = false }
+bytemuck = { version = "1.25.2", default-features = false }
 
 [profile.dev]
 panic = "abort"
 
 [profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
 panic = "abort"
-strip = true
+lto = true
+codegen-units = 1

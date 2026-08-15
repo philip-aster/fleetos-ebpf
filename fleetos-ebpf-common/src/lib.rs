@@ -1,66 +1,57 @@
-// C-compatible memory structs shared between Aya kernel code & userland fleetos-agent
-
 #![no_std]
 
-/// 128-bit truncated BLAKE3 identity fingerprint (16 bytes)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "user", derive(aya::Pod))]
-#[repr(C)]
-pub struct IdentityHash {
-    pub bytes: [u8; 16],
-}
+use bytemuck::{Pod, Zeroable};
+use fleetos_core::hash::IdentityFingerprint;
 
-impl IdentityHash {
-    pub const fn new(bytes: [u8; 16]) -> Self {
-        Self { bytes }
-    }
-}
-
-/// Key used in the `POLICY_MAP` eBPF hash table.
-/// Encapsulates the Source SVID Hash, Target SVID Hash, and Target Port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "user", derive(aya::Pod))]
+/// 40 bytes, 8-byte aligned. Used for exact policy matching.
 #[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
 pub struct EbpfPolicyKey {
-    /// 128-bit truncated BLAKE3 fingerprint of calling workload SVID
-    pub src_hash: IdentityHash,
-    /// 128-bit truncated BLAKE3 fingerprint of destination workload SVID
-    pub dst_hash: IdentityHash,
-    /// Destination port (e.g., 5432 for Postgres)
-    pub port: u16,
-    /// 16-bit explicit padding for 32/64-bit alignment compliance in eBPF maps
-    pub _pad: u16,
-}
+    pub src_fingerprint: IdentityFingerprint, // 16 bytes
+    pub dst_fingerprint: IdentityFingerprint, // 16 bytes
+    pub protocol: u8,                         // 1 byte  (0 = any, 6 = TCP, 17 = UDP)
+    pub _pad: [u8; 3],                        // 3 bytes (aligns to 4)
+    pub dst_port: u16,                        // 2 bytes (0 = any)
+    pub _pad2: [u8; 2],                       // 2 bytes (aligns to 8)
+} // Total: 40 bytes
 
-/// Value stored in the `POLICY_MAP` eBPF hash table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "user", derive(aya::Pod))]
+/// 32 bytes. Used for wildcard policy matching (ignores port/protocol).
 #[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
+pub struct EbpfPolicyWildcardKey {
+    pub src_fingerprint: IdentityFingerprint, // 16 bytes
+    pub dst_fingerprint: IdentityFingerprint, // 16 bytes
+} // Total: 32 bytes
+
+/// 16 bytes.
+/// Note: Field order is restructured from the spec to ensure `Pod` derives
+/// without implicit padding. `u64` requires 8-byte alignment.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 pub struct EbpfPolicyValue {
-    /// 1 = ALLOW, 0 = DROP
-    pub action: u8,
-    /// Reserved space for future telemetry / rate-limiting flags
-    pub _flags: u8,
-    pub _pad: u16,
-}
+    pub sag_version: u64, // offset 0, 8 bytes
+    pub decision: u8,     // offset 8, 1 byte (0 = deny, 1 = allow)
+    pub _pad: [u8; 7],    // offset 9, 7 bytes
+} // Total: 16 bytes
 
-/// Network Frame Overlay Header to transit packets
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "user", derive(aya::Pod))]
+/// 40 bytes. Observability event pushed to the ring buffer.
 #[repr(C)]
-pub struct FleetosHeader {
-    /// Magic identifier (0x464C = "FL")
-    pub magic: u16,
-    /// Protocol version (1)
-    pub version: u8,
-    /// Reserved flags
-    pub flags: u8,
-    /// Source Workload SPIFFE Hash
-    pub src_hash: IdentityHash,
-    /// Destination Workload SPIFFE Hash
-    pub dst_hash: IdentityHash,
-    /// Target Role ID (e.g., 1 = primary, 2 = replica)
-    pub role_id: u16,
-    /// Target Port
-    pub port: u16,
-}
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct FlowEvent {
+    pub src_hash: IdentityFingerprint, // 16 bytes
+    pub dst_hash: IdentityFingerprint, // 16 bytes
+    pub port: u16,                     // 2 bytes
+    pub action: u8,                    // 1 byte (0 = deny, 1 = allow)
+    pub direction: u8,                 // 1 byte (0 = ingress, 1 = egress)
+    pub _pad: [u8; 4],                 // 4 bytes
+} // Total: 40 bytes
+
+/// 12 bytes. Key for the LRU_HASH storing original destination state.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
+pub struct SockTuple {
+    pub src_ip: u32,   // 4 bytes
+    pub dst_ip: u32,   // 4 bytes
+    pub src_port: u16, // 2 bytes
+    pub dst_port: u16, // 2 bytes
+} // Total: 12 bytes
