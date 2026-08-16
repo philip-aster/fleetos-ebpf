@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![no_std]
 
 use bytemuck::{Pod, Zeroable};
-use fleetos_core::hash::IdentityFingerprint;
+// Re-export IdentityFingerprint so the eBPF bytecode crate doesn't need
+// to depend on fleetos-core directly.
+pub use fleetos_core::hash::IdentityFingerprint;
 
 /// 40 bytes, 8-byte aligned. Used for exact policy matching.
 #[repr(C)]
@@ -24,8 +28,10 @@ pub struct EbpfPolicyWildcardKey {
 } // Total: 32 bytes
 
 /// 16 bytes.
-/// Note: Field order is restructured from the spec to ensure `Pod` derives
-/// without implicit padding. `u64` requires 8-byte alignment.
+/// Note: The Lead Architect's directive specified `decision` (u8) before `sag_version` (u64).
+/// In standard `repr(C)`, this would cause 7 bytes of implicit padding after `decision`,
+/// resulting in a 24-byte struct. By moving `sag_version` to offset 0, we achieve a clean
+/// 16-byte struct that perfectly derives `Pod` and `Zeroable` without implicit padding.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct EbpfPolicyValue {

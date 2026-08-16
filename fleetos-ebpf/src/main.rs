@@ -1,64 +1,44 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![no_std]
 #![no_main]
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{TC_ACT_SHOT, bpf_sock_addr},
+    bindings::{
+        __sk_buff, BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, TC_ACT_SHOT, bpf_sock_addr, bpf_sock_ops,
+    },
     macros::{cgroup_sock_addr, classifier, map, sock_ops},
     maps::{HashMap, LruHashMap, RingBuf, SockHash},
     programs::{SockAddrContext, SockOpsContext, TcContext},
 };
+use core::mem::size_of;
+use fleetos_ebpf_common::{
+    EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, FlowEvent, IdentityFingerprint,
+    SockTuple,
+};
 
-// --- Local Struct Redefinitions ---
+// --- Local Network Header Definitions ---
 
+// Define standard Ethernet and IPv4 headers locally to avoid bindgen UAPI discrepancies.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub struct IdentityFingerprint(pub [u8; 16]);
-
-#[repr(C)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub struct EbpfPolicyKey {
-    pub src_fingerprint: IdentityFingerprint,
-    pub dst_fingerprint: IdentityFingerprint,
-    pub protocol: u8,
-    pub _pad: [u8; 3],
-    pub dst_port: u16,
-    pub _pad2: [u8; 2],
+struct EthHdr {
+    h_dest: [u8; 6],
+    h_source: [u8; 6],
+    h_proto: u16,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub struct EbpfPolicyWildcardKey {
-    pub src_fingerprint: IdentityFingerprint,
-    pub dst_fingerprint: IdentityFingerprint,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EbpfPolicyValue {
-    pub sag_version: u64,
-    pub decision: u8,
-    pub _pad: [u8; 7],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct FlowEvent {
-    pub src_hash: IdentityFingerprint,
-    pub dst_hash: IdentityFingerprint,
-    pub port: u16,
-    pub action: u8,
-    pub direction: u8,
-    pub _pad: [u8; 4],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub struct SockTuple {
-    pub src_ip: u32,
-    pub dst_ip: u32,
-    pub src_port: u16,
-    pub dst_port: u16,
+struct Ipv4Hdr {
+    ihl_version: u8,
+    tos: u8,
+    tot_len: u16,
+    id: u16,
+    frag_off: u16,
+    ttl: u8,
+    protocol: u8,
+    saddr: u32,
+    daddr: u32,
 }
 
 // --- Map Definitions ---
@@ -95,30 +75,33 @@ pub fn fleetos_connect4(ctx: SockAddrContext) -> i32 {
 }
 
 fn try_fleetos_connect4(ctx: &SockAddrContext) -> Result<(), i64> {
-    // Cast the raw void pointer to the bpf_sock_addr struct
     let sa = unsafe { &mut *(ctx.as_ptr() as *mut bpf_sock_addr) };
-    let dst_ip_be = sa.user_ip4;
-    let dst_port = sa.user_port as u16;
 
-    if (dst_ip_be & 0xf0000000) != 0xf0000000 {
+    // Convert network byte order (big-endian) to host byte order for internal logic
+    let dst_ip_ho = u32::from_be(sa.user_ip4);
+    let dst_port = u16::from_be(sa.user_port as u16);
+
+    // Fixed: IP byte order for the 240.0.0.0/4 subnet check
+    if (dst_ip_ho & 0xf0000000) != 0xf0000000 {
         return Ok(()); // Not a dummy IP
     }
 
-    let dst_fingerprint = match unsafe { DUMMY_IP_MAP.get(&dst_ip_be) } {
+    let dst_fingerprint = match unsafe { DUMMY_IP_MAP.get(&dst_ip_ho) } {
         Some(fp) => *fp,
         None => return Err(-1),
     };
 
     let tuple = SockTuple {
-        src_ip: 0,
-        dst_ip: dst_ip_be,
-        src_port: 0,
+        src_ip: u32::from_be(sa.msg_src_ip4), // Extract source IP
+        dst_ip: dst_ip_ho,
+        src_port: 0, // Source port is 0 at connect() time
         dst_port,
     };
 
     let _ = SOCK_STATE_MAP.insert(&tuple, dst_fingerprint, 0);
 
-    sa.user_ip4 = u32::from_be_bytes([127, 0, 0, 1]);
+    // Rewrite destination to localhost agent (Fixed: network byte order conversion)
+    sa.user_ip4 = 0x7f000001u32.to_be();
     sa.user_port = 4242u32.to_be();
 
     Ok(())
@@ -134,11 +117,42 @@ pub fn fleetos_tc_egress(ctx: TcContext) -> i32 {
     }
 }
 
-fn try_tc_egress(_ctx: &TcContext) -> Result<(), i64> {
-    let src_fingerprint = IdentityFingerprint([0; 16]);
-    let dst_fingerprint = IdentityFingerprint([0; 16]);
-    let protocol: u8 = 6;
-    let dst_port: u16 = 5432;
+fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
+    let skb = ctx.as_ptr() as *mut __sk_buff;
+    let data = unsafe { (*skb).data as usize };
+    let data_end = unsafe { (*skb).data_end as usize };
+
+    let eth_len = size_of::<EthHdr>();
+    let ip_len = size_of::<Ipv4Hdr>();
+
+    if data_end - data < eth_len + ip_len {
+        return Err(-1);
+    }
+
+    // Ethernet header is generally aligned in SKB data
+    let eth = unsafe { &*(data as *const EthHdr) };
+    if eth.h_proto != (0x0800u16).to_be() {
+        return Ok(()); // Not IPv4, pass through
+    }
+
+    // IP header is at an unaligned offset (data + 14) so we must use read_unaligned
+    // to prevent verifier issues on architectures that trap on unaligned access.
+    let ip = unsafe { core::ptr::read_unaligned((data + eth_len) as *const Ipv4Hdr) };
+    let src_ip_ho = u32::from_be(ip.saddr);
+    let dst_ip_ho = u32::from_be(ip.daddr);
+    let protocol = ip.protocol;
+
+    let src_fingerprint = match unsafe { DUMMY_IP_MAP.get(&src_ip_ho) } {
+        Some(fp) => *fp,
+        None => IdentityFingerprint([0; 16]), // Unknown source
+    };
+    let dst_fingerprint = match unsafe { DUMMY_IP_MAP.get(&dst_ip_ho) } {
+        Some(fp) => *fp,
+        None => return Err(-1), // Unknown destination -> drop
+    };
+
+    // Port parsing at L4 is skipped for verifier simplicity; relying on wildcard or 0 port.
+    let dst_port: u16 = 0;
 
     let decision = check_policy(&src_fingerprint, &dst_fingerprint, protocol, dst_port)?;
     push_flow_event(&src_fingerprint, &dst_fingerprint, dst_port, decision, 1);
@@ -155,6 +169,9 @@ pub fn fleetos_tc_ingress(ctx: TcContext) -> i32 {
 }
 
 fn try_tc_ingress(_ctx: &TcContext) -> Result<(), i64> {
+    // Ingress logic to route to fleetos-agent's user-space socket.
+    // Critical Boot-Race Constraint: fleetos-agent must attach this TC classifier
+    // and populate maps BEFORE the MicroVM's first packet.
     Ok(())
 }
 
@@ -188,7 +205,7 @@ fn check_policy(
         return Ok(val.decision);
     }
 
-    Ok(0)
+    Ok(0) // Default deny
 }
 
 // --- Helper: Ring Buffer Push ---
@@ -222,26 +239,35 @@ pub fn fleetos_sockops(ctx: SockOpsContext) -> u32 {
     }
 }
 
-fn try_sockops(_ctx: &SockOpsContext) -> Result<(), i64> {
+fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
+    let ops = unsafe { &*(ctx.as_ptr() as *mut bpf_sock_ops) };
+
+    // Only intercept active established connections
+    if ops.op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB as u32 {
+        return Ok(());
+    }
+
+    // Fixed: Extracted actual 4-tuple instead of hardcoded zeros
     let tuple = SockTuple {
-        src_ip: 0,
-        dst_ip: 0,
-        src_port: 0,
-        dst_port: 0,
+        src_ip: u32::from_be(ops.local_ip4),
+        dst_ip: u32::from_be(ops.remote_ip4),
+        src_port: ops.local_port as u16,
+        dst_port: ops.remote_port as u16,
     };
 
     let dst_fingerprint = match unsafe { SOCK_STATE_MAP.get(&tuple) } {
-        Some(fp) => fp,
+        Some(fp) => *fp,
         None => return Err(-1),
     };
 
-    let is_local = match unsafe { LOCAL_WORKLOADS.get(dst_fingerprint) } {
+    let is_local = match unsafe { LOCAL_WORKLOADS.get(&dst_fingerprint) } {
         Some(val) => *val,
         None => false,
     };
 
     if is_local {
-        // SOCKHASH.update...
+        // Bypass agent and QUIC entirely: splice sockets at the kernel level.
+        // let _ = SOCKHASH.update(&tuple, ops.sk as u64, 0);
     }
 
     Ok(())

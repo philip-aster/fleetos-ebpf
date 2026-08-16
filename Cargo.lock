@@ -263,6 +263,7 @@ name = "fleetos-ebpf"
 version = "0.1.0"
 dependencies = [
  "aya-ebpf",
+ "fleetos-ebpf-common",
 ]
 
 [[package]]

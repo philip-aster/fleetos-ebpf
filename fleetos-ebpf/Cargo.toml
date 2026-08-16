@@ -8,6 +8,8 @@ description = "FleetOS eBPF Kernel Level Enforcement and Routing Plane"
 
 [dependencies]
 aya-ebpf = "0.2.1"
+# Added fleetos-ebpf-common to resolve ABI Divergence blocker
+fleetos-ebpf-common = { path = "../fleetos-ebpf-common", default-features = false }
 
 [[bin]]
 name = "fleetos-ebpf"
