@@ -12,15 +12,29 @@ use aya_ebpf::{
     maps::{HashMap, LruHashMap, RingBuf, SockHash},
     programs::{SockAddrContext, SockOpsContext, TcContext},
 };
+use core::alloc::{GlobalAlloc, Layout};
 use core::mem::size_of;
 use fleetos_ebpf_common::{
     EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, FlowEvent, IdentityFingerprint,
     SockTuple,
 };
 
+// --- Dummy Allocator (Satisfies `alloc` crate pulled in by fleetos-core's serde) ---
+
+struct BpfNoAlloc;
+unsafe impl GlobalAlloc for BpfNoAlloc {
+    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+        // We should never hit this in the BPF hot path.
+        core::ptr::null_mut()
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static A: BpfNoAlloc = BpfNoAlloc;
+
 // --- Local Network Header Definitions ---
 
-// Define standard Ethernet and IPv4 headers locally to avoid bindgen UAPI discrepancies.
 #[repr(C)]
 struct EthHdr {
     h_dest: [u8; 6],
@@ -77,11 +91,9 @@ pub fn fleetos_connect4(ctx: SockAddrContext) -> i32 {
 fn try_fleetos_connect4(ctx: &SockAddrContext) -> Result<(), i64> {
     let sa = unsafe { &mut *(ctx.as_ptr() as *mut bpf_sock_addr) };
 
-    // Convert network byte order (big-endian) to host byte order for internal logic
     let dst_ip_ho = u32::from_be(sa.user_ip4);
     let dst_port = u16::from_be(sa.user_port as u16);
 
-    // Fixed: IP byte order for the 240.0.0.0/4 subnet check
     if (dst_ip_ho & 0xf0000000) != 0xf0000000 {
         return Ok(()); // Not a dummy IP
     }
@@ -94,13 +106,12 @@ fn try_fleetos_connect4(ctx: &SockAddrContext) -> Result<(), i64> {
     let tuple = SockTuple {
         src_ip: u32::from_be(sa.msg_src_ip4),
         dst_ip: dst_ip_ho,
-        src_port: 0, // Source port is 0 at connect() time
+        src_port: 0,
         dst_port,
     };
 
     let _ = SOCK_STATE_MAP.insert(&tuple, dst_fingerprint, 0);
 
-    // Rewrite destination to localhost agent
     sa.user_ip4 = 0x7f000001u32.to_be();
     sa.user_port = 4242u32.to_be();
 
@@ -129,26 +140,23 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
         return Err(-1);
     }
 
-    // Fixed: Use read_unaligned for Ethernet header to prevent alignment faults
     let eth = unsafe { core::ptr::read_unaligned(data as *const EthHdr) };
     if eth.h_proto != (0x0800u16).to_be() {
-        return Ok(()); // Not IPv4, pass through
+        return Ok(());
     }
 
-    // IP header is at an unaligned offset (data + 14)
     let ip = unsafe { core::ptr::read_unaligned((data + eth_len) as *const Ipv4Hdr) };
     let src_ip_ho = u32::from_be(ip.saddr);
     let dst_ip_ho = u32::from_be(ip.daddr);
     let protocol = ip.protocol;
 
-    // Explicitly zeroed fallback to satisfy strict verifier initialization checks
     let src_fingerprint = match unsafe { DUMMY_IP_MAP.get(&src_ip_ho) } {
         Some(fp) => *fp,
         None => IdentityFingerprint([0; 16]),
     };
     let dst_fingerprint = match unsafe { DUMMY_IP_MAP.get(&dst_ip_ho) } {
         Some(fp) => *fp,
-        None => return Err(-1), // Unknown destination -> drop
+        None => return Err(-1),
     };
 
     let dst_port: u16 = 0;
@@ -168,9 +176,6 @@ pub fn fleetos_tc_ingress(ctx: TcContext) -> i32 {
 }
 
 fn try_tc_ingress(_ctx: &TcContext) -> Result<(), i64> {
-    // Ingress logic to route to fleetos-agent's user-space socket.
-    // Critical Boot-Race Constraint: fleetos-agent must attach this TC classifier
-    // and populate maps BEFORE the MicroVM's first packet.
     Ok(())
 }
 
@@ -182,8 +187,6 @@ fn check_policy(
     protocol: u8,
     dst_port: u16,
 ) -> Result<u8, i64> {
-    // Fixed: Explicit field-by-field initialization with zeroed arrays guarantees
-    // no uninitialized padding bytes are passed to BPF helpers.
     let exact_key = EbpfPolicyKey {
         src_fingerprint: *src,
         dst_fingerprint: *dst,
@@ -243,12 +246,10 @@ pub fn fleetos_sockops(ctx: SockOpsContext) -> u32 {
 fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
     let ops = unsafe { &*(ctx.as_ptr() as *mut bpf_sock_ops) };
 
-    // Only intercept active established connections
     if ops.op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB as u32 {
         return Ok(());
     }
 
-    // Fixed: Convert ports from network to host byte order to match cgroup_sock_addr insertion
     let tuple = SockTuple {
         src_ip: u32::from_be(ops.local_ip4),
         dst_ip: u32::from_be(ops.remote_ip4),
@@ -267,7 +268,6 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
     };
 
     if is_local {
-        // Bypass agent and QUIC entirely: splice sockets at the kernel level.
         // let _ = SOCKHASH.update(&tuple, ops.sk as u64, 0);
     }
 
