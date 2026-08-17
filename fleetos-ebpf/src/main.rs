@@ -12,26 +12,11 @@ use aya_ebpf::{
     maps::{HashMap, LruHashMap, RingBuf, SockHash},
     programs::{SockAddrContext, SockOpsContext, TcContext},
 };
-use core::alloc::{GlobalAlloc, Layout};
 use core::mem::size_of;
 use fleetos_ebpf_common::{
-    EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, FlowEvent, IdentityFingerprint,
-    SockTuple,
+    EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, FlowEvent, HostOrderIpv4, HostOrderPort,
+    IdentityFingerprint, SockTuple,
 };
-
-// --- Dummy Allocator (Satisfies `alloc` crate pulled in by fleetos-core's serde) ---
-
-struct BpfNoAlloc;
-unsafe impl GlobalAlloc for BpfNoAlloc {
-    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-        // We should never hit this in the BPF hot path.
-        core::ptr::null_mut()
-    }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-}
-
-#[global_allocator]
-static A: BpfNoAlloc = BpfNoAlloc;
 
 // --- Local Network Header Definitions ---
 
@@ -58,7 +43,7 @@ struct Ipv4Hdr {
 // --- Map Definitions ---
 
 #[map]
-static DUMMY_IP_MAP: HashMap<u32, IdentityFingerprint> = HashMap::pinned(1024, 0);
+static DUMMY_IP_MAP: HashMap<HostOrderIpv4, IdentityFingerprint> = HashMap::pinned(1024, 0);
 
 #[map]
 static SOCK_STATE_MAP: LruHashMap<SockTuple, IdentityFingerprint> = LruHashMap::pinned(4096, 0);
@@ -91,10 +76,11 @@ pub fn fleetos_connect4(ctx: SockAddrContext) -> i32 {
 fn try_fleetos_connect4(ctx: &SockAddrContext) -> Result<(), i64> {
     let sa = unsafe { &mut *(ctx.as_ptr() as *mut bpf_sock_addr) };
 
-    let dst_ip_ho = u32::from_be(sa.user_ip4);
-    let dst_port = u16::from_be(sa.user_port as u16);
+    let dst_ip_ho = HostOrderIpv4::from_network(sa.user_ip4);
+    let dst_port = HostOrderPort::from_network(sa.user_port as u16);
 
-    if (dst_ip_ho & 0xf0000000) != 0xf0000000 {
+    // Safe to use .0 here since it's within our own type boundary
+    if (dst_ip_ho.0 & 0xf0000000) != 0xf0000000 {
         return Ok(()); // Not a dummy IP
     }
 
@@ -104,14 +90,15 @@ fn try_fleetos_connect4(ctx: &SockAddrContext) -> Result<(), i64> {
     };
 
     let tuple = SockTuple {
-        src_ip: u32::from_be(sa.msg_src_ip4),
+        src_ip: HostOrderIpv4::from_network(sa.msg_src_ip4),
         dst_ip: dst_ip_ho,
-        src_port: 0,
+        src_port: HostOrderPort(0), // Source port is 0 at connect() time
         dst_port,
     };
 
     let _ = SOCK_STATE_MAP.insert(&tuple, dst_fingerprint, 0);
 
+    // Rewrite destination to localhost agent
     sa.user_ip4 = 0x7f000001u32.to_be();
     sa.user_port = 4242u32.to_be();
 
@@ -142,12 +129,12 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
 
     let eth = unsafe { core::ptr::read_unaligned(data as *const EthHdr) };
     if eth.h_proto != (0x0800u16).to_be() {
-        return Ok(());
+        return Ok(()); // Not IPv4, pass through
     }
 
     let ip = unsafe { core::ptr::read_unaligned((data + eth_len) as *const Ipv4Hdr) };
-    let src_ip_ho = u32::from_be(ip.saddr);
-    let dst_ip_ho = u32::from_be(ip.daddr);
+    let src_ip_ho = HostOrderIpv4::from_network(ip.saddr);
+    let dst_ip_ho = HostOrderIpv4::from_network(ip.daddr);
     let protocol = ip.protocol;
 
     let src_fingerprint = match unsafe { DUMMY_IP_MAP.get(&src_ip_ho) } {
@@ -159,7 +146,7 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
         None => return Err(-1),
     };
 
-    let dst_port: u16 = 0;
+    let dst_port = HostOrderPort(0); // Port parsing skipped
 
     let decision = check_policy(&src_fingerprint, &dst_fingerprint, protocol, dst_port)?;
     push_flow_event(&src_fingerprint, &dst_fingerprint, dst_port, decision, 1);
@@ -176,6 +163,9 @@ pub fn fleetos_tc_ingress(ctx: TcContext) -> i32 {
 }
 
 fn try_tc_ingress(_ctx: &TcContext) -> Result<(), i64> {
+    // Ingress logic to route to fleetos-agent's user-space socket.
+    // Critical Boot-Race Constraint: fleetos-agent must attach this TC classifier
+    // and populate maps BEFORE the MicroVM's first packet.
     Ok(())
 }
 
@@ -185,7 +175,7 @@ fn check_policy(
     src: &IdentityFingerprint,
     dst: &IdentityFingerprint,
     protocol: u8,
-    dst_port: u16,
+    dst_port: HostOrderPort,
 ) -> Result<u8, i64> {
     let exact_key = EbpfPolicyKey {
         src_fingerprint: *src,
@@ -217,7 +207,7 @@ fn check_policy(
 fn push_flow_event(
     src: &IdentityFingerprint,
     dst: &IdentityFingerprint,
-    port: u16,
+    port: HostOrderPort,
     action: u8,
     direction: u8,
 ) {
@@ -251,10 +241,10 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
     }
 
     let tuple = SockTuple {
-        src_ip: u32::from_be(ops.local_ip4),
-        dst_ip: u32::from_be(ops.remote_ip4),
-        src_port: u16::from_be(ops.local_port as u16),
-        dst_port: u16::from_be(ops.remote_port as u16),
+        src_ip: HostOrderIpv4::from_network(ops.local_ip4),
+        dst_ip: HostOrderIpv4::from_network(ops.remote_ip4),
+        src_port: HostOrderPort::from_network(ops.local_port as u16),
+        dst_port: HostOrderPort::from_network(ops.remote_port as u16),
     };
 
     let dst_fingerprint = match unsafe { SOCK_STATE_MAP.get(&tuple) } {
