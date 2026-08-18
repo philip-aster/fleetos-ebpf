@@ -62,4 +62,3 @@ file target/bpfel-unknown-none/release/fleetos-ebpf
 ## License
 
 Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
-```
