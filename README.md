@@ -1,6 +1,6 @@
 # fleetos-ebpf
 
-The kernel-level enforcement and routing plane for FleetOS.
+The kernel-level enforcement and routing plane for Fleet Orchestration System (FleetOS).
 
 `fleetos-ebpf` provides the eBPF programs and shared C-structs that enforce FleetOS's "identity is the address" networking model directly at the kernel level. It bridges user-space workloads (Containerd containers and Cloud Hypervisor MicroVMs) and the dark overlay network by intercepting standard network traffic, mapping it to 128-bit `IdentityFingerprint` hashes, and enforcing strict, default-deny Authorization (AuthZ) policies.
 
