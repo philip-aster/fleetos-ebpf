@@ -59,7 +59,7 @@ pub struct EbpfPolicyWildcardKey {
 
 /// 16 bytes.
 #[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
 pub struct EbpfPolicyValue {
     pub sag_version: u64, // offset 0, 8 bytes
     pub decision: u8,     // offset 8, 1 byte (0 = deny, 1 = allow)
