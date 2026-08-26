@@ -87,3 +87,45 @@ pub struct SockTuple {
     pub src_port: HostOrderPort, // 2 bytes
     pub dst_port: HostOrderPort, // 2 bytes
 } // Total: 12 bytes
+
+// --- ER-1 REV1: Route Map Value (40 bytes, 8-byte aligned) ---
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
+pub struct DummyIpRouteValue {
+    pub dst_fp: IdentityFingerprint, // 16 bytes — Phase B key input
+    pub target_agent_fp: IdentityFingerprint, // 16 bytes — Phase C rewrite target
+    pub sag_version: u64,            //  8 bytes — purge stamp
+} // Total: 40 bytes
+
+// --- Sock State Value (32 bytes) ---
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
+pub struct SockStateValue {
+    pub dst_fp: IdentityFingerprint,
+    pub target_agent_fp: IdentityFingerprint,
+} // Total: 32 bytes
+
+// --- ER-2 REV1: policy_stats normative enumeration ---
+pub const STAT_ALLOW_HITS: u32 = 0;
+pub const STAT_DENY_HITS: u32 = 1;
+pub const STAT_WILDCARD_HITS: u32 = 2;
+pub const STAT_DEFAULT_DENY_DROPS: u32 = 3;
+pub const STAT_ROUTE_MISSES: u32 = 4;
+pub const STAT_PASS_THROUGHS: u32 = 5;
+pub const STAT_REWRITES: u32 = 6;
+pub const STAT_RESERVED: u32 = 7;
+
+// --- ER-4: ABI Layout Assertions ---
+const _: () = assert!(core::mem::size_of::<EbpfPolicyKey>() == 40);
+const _: () = assert!(core::mem::size_of::<EbpfPolicyWildcardKey>() == 32);
+const _: () = assert!(core::mem::size_of::<EbpfPolicyValue>() == 16);
+const _: () = assert!(core::mem::size_of::<FlowEvent>() == 40);
+const _: () = assert!(core::mem::size_of::<SockTuple>() == 12);
+const _: () = assert!(core::mem::size_of::<DummyIpRouteValue>() == 40);
+const _: () = assert!(core::mem::size_of::<SockStateValue>() == 32);
+
+// Alignment is 2, not 1: HostOrderPort is #[repr(transparent)] over u16.
+const _: () = assert!(core::mem::align_of::<EbpfPolicyKey>() == 2);
+const _: () = assert!(core::mem::align_of::<DummyIpRouteValue>() == 8);
+
+pub const fn assert_layouts() {}

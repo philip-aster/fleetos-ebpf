@@ -9,13 +9,15 @@ use aya_ebpf::{
         __sk_buff, BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, TC_ACT_SHOT, bpf_sock_addr, bpf_sock_ops,
     },
     macros::{cgroup_sock_addr, classifier, map, sock_ops},
-    maps::{HashMap, LruHashMap, RingBuf, SockHash},
+    maps::{Array, HashMap, LruHashMap, RingBuf, SockHash},
     programs::{SockAddrContext, SockOpsContext, TcContext},
 };
 use core::mem::size_of;
 use fleetos_ebpf_common::{
-    EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, FlowEvent, HostOrderIpv4, HostOrderPort,
-    IdentityFingerprint, SockTuple,
+    DummyIpRouteValue, EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, FlowEvent,
+    HostOrderIpv4, HostOrderPort, IdentityFingerprint, STAT_ALLOW_HITS, STAT_DEFAULT_DENY_DROPS,
+    STAT_DENY_HITS, STAT_PASS_THROUGHS, STAT_REWRITES, STAT_ROUTE_MISSES, STAT_WILDCARD_HITS,
+    SockStateValue, SockTuple,
 };
 
 // --- Local Network Header Definitions ---
@@ -43,23 +45,21 @@ struct Ipv4Hdr {
 // --- Map Definitions ---
 
 #[map]
-static DUMMY_IP_MAP: HashMap<HostOrderIpv4, IdentityFingerprint> = HashMap::pinned(1024, 0);
-
+static DUMMY_IP_ROUTE_MAP: HashMap<HostOrderIpv4, DummyIpRouteValue> = HashMap::pinned(262144, 0);
 #[map]
-static SOCK_STATE_MAP: LruHashMap<SockTuple, IdentityFingerprint> = LruHashMap::pinned(4096, 0);
-
+static SRC_IDENTITY_MAP: HashMap<HostOrderIpv4, IdentityFingerprint> = HashMap::pinned(1024, 0);
+#[map]
+static SOCK_STATE_MAP: LruHashMap<SockTuple, SockStateValue> = LruHashMap::pinned(4096, 0);
+#[map]
+static POLICY_STATS: Array<u64> = Array::pinned(8, 0);
 #[map]
 static POLICY_EXACT: HashMap<EbpfPolicyKey, EbpfPolicyValue> = HashMap::pinned(8192, 0);
-
 #[map]
 static POLICY_WILDCARD: HashMap<EbpfPolicyWildcardKey, EbpfPolicyValue> = HashMap::pinned(4096, 0);
-
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::pinned(256 * 4096, 0);
-
 #[map]
 static LOCAL_WORKLOADS: HashMap<IdentityFingerprint, bool> = HashMap::pinned(1024, 0);
-
 #[map]
 static SOCKHASH: SockHash<SockTuple> = SockHash::pinned(4096, 0);
 
@@ -73,35 +73,66 @@ pub fn fleetos_connect4(ctx: SockAddrContext) -> i32 {
     }
 }
 
+#[inline(always)]
+fn bump_stat(index: u32) {
+    if let Some(ptr) = { POLICY_STATS.get_ptr_mut(index) } {
+        unsafe { *ptr += 1 };
+    }
+}
+
 fn try_fleetos_connect4(ctx: &SockAddrContext) -> Result<(), i64> {
     let sa = unsafe { &mut *(ctx.as_ptr() as *mut bpf_sock_addr) };
-
     let dst_ip_ho = HostOrderIpv4::from_network(sa.user_ip4);
     let dst_port = HostOrderPort::from_network(sa.user_port as u16);
 
-    // Safe to use .0 here since it's within our own type boundary
+    // Phase 0: Non-overlay passthrough
     if (dst_ip_ho.0 & 0xf0000000) != 0xf0000000 {
-        return Ok(()); // Not a dummy IP
+        bump_stat(STAT_PASS_THROUGHS);
+        return Ok(());
     }
 
-    let dst_fingerprint = match unsafe { DUMMY_IP_MAP.get(&dst_ip_ho) } {
-        Some(fp) => *fp,
-        None => return Err(-1),
+    // Phase A: Resolution
+    let route = match unsafe { DUMMY_IP_ROUTE_MAP.get(&dst_ip_ho) } {
+        Some(v) => *v,
+        None => {
+            bump_stat(STAT_ROUTE_MISSES);
+            return Err(-1);
+        }
     };
+
+    // Source Identity (Agent populated)
+    let src_ip_ho = HostOrderIpv4::from_network(sa.msg_src_ip4);
+    let src_fingerprint = match unsafe { SRC_IDENTITY_MAP.get(&src_ip_ho) } {
+        Some(fp) => *fp,
+        None => {
+            bump_stat(STAT_DEFAULT_DENY_DROPS);
+            return Err(-1);
+        } // Unidentifiable = deny
+    };
+
+    // Phase B: Authorization
+    let decision = check_policy(&src_fingerprint, &route.dst_fp, sa.protocol as u8, dst_port)?;
+    if decision == 0 {
+        return Err(-1);
+    }
+
+    // Phase C: Rewrite
+    bump_stat(STAT_REWRITES); // Invariant: ALLOW_HITS == REWRITES in this hook
 
     let tuple = SockTuple {
-        src_ip: HostOrderIpv4::from_network(sa.msg_src_ip4),
+        src_ip: src_ip_ho,
         dst_ip: dst_ip_ho,
-        src_port: HostOrderPort(0), // Source port is 0 at connect() time
+        src_port: HostOrderPort(0),
         dst_port,
     };
+    let state = SockStateValue {
+        dst_fp: route.dst_fp,
+        target_agent_fp: route.target_agent_fp,
+    };
+    let _ = SOCK_STATE_MAP.insert(&tuple, &state, 0);
 
-    let _ = SOCK_STATE_MAP.insert(&tuple, dst_fingerprint, 0);
-
-    // Rewrite destination to localhost agent
     sa.user_ip4 = 0x7f000001u32.to_be();
     sa.user_port = 4242u32.to_be();
-
     Ok(())
 }
 
@@ -119,37 +150,42 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
     let skb = ctx.as_ptr() as *mut __sk_buff;
     let data = unsafe { (*skb).data as usize };
     let data_end = unsafe { (*skb).data_end as usize };
-
     let eth_len = size_of::<EthHdr>();
     let ip_len = size_of::<Ipv4Hdr>();
 
     if data_end - data < eth_len + ip_len {
         return Err(-1);
     }
-
     let eth = unsafe { core::ptr::read_unaligned(data as *const EthHdr) };
     if eth.h_proto != (0x0800u16).to_be() {
-        return Ok(()); // Not IPv4, pass through
+        return Ok(());
     }
 
     let ip = unsafe { core::ptr::read_unaligned((data + eth_len) as *const Ipv4Hdr) };
     let src_ip_ho = HostOrderIpv4::from_network(ip.saddr);
     let dst_ip_ho = HostOrderIpv4::from_network(ip.daddr);
-    let protocol = ip.protocol;
 
-    let src_fingerprint = match unsafe { DUMMY_IP_MAP.get(&src_ip_ho) } {
-        Some(fp) => *fp,
-        None => IdentityFingerprint([0; 16]),
+    if (dst_ip_ho.0 & 0xf0000000) != 0xf0000000 {
+        bump_stat(STAT_PASS_THROUGHS);
+        return Ok(());
+    }
+
+    let route = match unsafe { DUMMY_IP_ROUTE_MAP.get(&dst_ip_ho) } {
+        Some(v) => *v,
+        None => {
+            bump_stat(STAT_ROUTE_MISSES);
+            return Err(-1);
+        }
     };
-    let dst_fingerprint = match unsafe { DUMMY_IP_MAP.get(&dst_ip_ho) } {
+
+    let src_fingerprint = match unsafe { SRC_IDENTITY_MAP.get(&src_ip_ho) } {
         Some(fp) => *fp,
-        None => return Err(-1),
+        None => IdentityFingerprint([0; 16]), // Fall through to default deny
     };
 
-    let dst_port = HostOrderPort(0); // Port parsing skipped
-
-    let decision = check_policy(&src_fingerprint, &dst_fingerprint, protocol, dst_port)?;
-    push_flow_event(&src_fingerprint, &dst_fingerprint, dst_port, decision, 1);
+    let dst_port = HostOrderPort(0);
+    let decision = check_policy(&src_fingerprint, &route.dst_fp, ip.protocol, dst_port)?;
+    push_flow_event(&src_fingerprint, &route.dst_fp, dst_port, decision, 1);
 
     if decision == 1 { Ok(()) } else { Err(-1) }
 }
@@ -185,8 +221,12 @@ fn check_policy(
         dst_port,
         _pad2: [0; 2],
     };
-
     if let Some(val) = unsafe { POLICY_EXACT.get(&exact_key) } {
+        bump_stat(if val.decision == 1 {
+            STAT_ALLOW_HITS
+        } else {
+            STAT_DENY_HITS
+        });
         return Ok(val.decision);
     }
 
@@ -194,12 +234,18 @@ fn check_policy(
         src_fingerprint: *src,
         dst_fingerprint: *dst,
     };
-
     if let Some(val) = unsafe { POLICY_WILDCARD.get(&wildcard_key) } {
+        bump_stat(STAT_WILDCARD_HITS);
+        bump_stat(if val.decision == 1 {
+            STAT_ALLOW_HITS
+        } else {
+            STAT_DENY_HITS
+        });
         return Ok(val.decision);
     }
 
-    Ok(0) // Default deny
+    bump_stat(STAT_DEFAULT_DENY_DROPS);
+    Ok(0)
 }
 
 // --- Helper: Ring Buffer Push ---
@@ -235,7 +281,6 @@ pub fn fleetos_sockops(ctx: SockOpsContext) -> u32 {
 
 fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
     let ops = unsafe { &*(ctx.as_ptr() as *mut bpf_sock_ops) };
-
     if ops.op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB as u32 {
         return Ok(());
     }
@@ -247,12 +292,12 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
         dst_port: HostOrderPort::from_network(ops.remote_port as u16),
     };
 
-    let dst_fingerprint = match unsafe { SOCK_STATE_MAP.get(&tuple) } {
-        Some(fp) => *fp,
+    let state = match unsafe { SOCK_STATE_MAP.get(&tuple) } {
+        Some(v) => *v,
         None => return Err(-1),
     };
 
-    let is_local = match unsafe { LOCAL_WORKLOADS.get(&dst_fingerprint) } {
+    let is_local = match unsafe { LOCAL_WORKLOADS.get(&state.dst_fp) } {
         Some(val) => *val,
         None => false,
     };
@@ -260,7 +305,6 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
     if is_local {
         // let _ = SOCKHASH.update(&tuple, ops.sk as u64, 0);
     }
-
     Ok(())
 }
 
