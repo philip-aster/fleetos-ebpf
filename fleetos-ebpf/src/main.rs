@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+//
+// Kernel floor (EBPF-CR Q1 ruling, recorded per Orchestrator memo):
+// production target >= 5.15 LTS. Hard floor is 5.8 (BPF_MAP_TYPE_RINGBUF
+// for FLOW_EVENTS). The v0.1.3 socket-cookie keying (EBPF-CR-1) needs
+// bpf_get_socket_cookie in CGROUP_SOCK_ADDR (~5.1) and SK_MSG (~5.2),
+// both below the floor — any kernel that loads these programs today
+// already supports it.
 
 #![no_std]
 #![no_main]
@@ -152,7 +159,6 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
     let data_end = unsafe { (*skb).data_end as usize };
     let eth_len = size_of::<EthHdr>();
     let ip_len = size_of::<Ipv4Hdr>();
-
     if data_end - data < eth_len + ip_len {
         return Err(-1);
     }
@@ -160,7 +166,6 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
     if eth.h_proto != (0x0800u16).to_be() {
         return Ok(());
     }
-
     let ip = unsafe { core::ptr::read_unaligned((data + eth_len) as *const Ipv4Hdr) };
     let src_ip_ho = HostOrderIpv4::from_network(ip.saddr);
     let dst_ip_ho = HostOrderIpv4::from_network(ip.daddr);
@@ -170,6 +175,18 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
         return Ok(());
     }
 
+    // EBPF-CR-4 / Q5 ruling: non-first overlay IP fragments carry no transport
+    // header, so port-specific policy cannot be evaluated on them. Deliberate
+    // fragmentation is a port-DENY bypass vector and the dark-overlay posture
+    // is fail-closed: drop. First fragments and unfragmented packets
+    // (offset == 0) proceed to normal evaluation. No stat bump: index 7 is
+    // RESERVED in control's normative enumeration; a fragment-drop counter
+    // needs a newly assigned index from control.
+    let frag_off = u16::from_be(ip.frag_off);
+    if (frag_off & 0x1FFF) != 0 {
+        return Err(-1);
+    }
+
     let route = match unsafe { DUMMY_IP_ROUTE_MAP.get(&dst_ip_ho) } {
         Some(v) => *v,
         None => {
@@ -177,16 +194,33 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
             return Err(-1);
         }
     };
-
     let src_fingerprint = match unsafe { SRC_IDENTITY_MAP.get(&src_ip_ho) } {
         Some(fp) => *fp,
         None => IdentityFingerprint([0; 16]), // Fall through to default deny
     };
 
-    let dst_port = HostOrderPort(0);
+    // EBPF-CR-4: transport-layer destination port (parity with the containerd
+    // path). IHL gives the true IPv4 header length so options cannot shift the
+    // transport offset; IHL < 5 is malformed → fail-closed. TCP and UDP both
+    // carry the destination port at offset 2 of the transport header; other
+    // protocols stay on the wildcard tier (port 0) per the CR.
+    let ihl = (ip.ihl_version & 0x0f) as usize;
+    if ihl < 5 {
+        return Err(-1);
+    }
+    let dst_port = if ip.protocol == 6 || ip.protocol == 17 {
+        let port_off = eth_len + ihl * 4 + 2;
+        if data_end - data < port_off + 2 {
+            return Err(-1); // truncated transport header — fail-closed
+        }
+        let port_be = unsafe { core::ptr::read_unaligned((data + port_off) as *const u16) };
+        HostOrderPort::from_network(port_be)
+    } else {
+        HostOrderPort(0)
+    };
+
     let decision = check_policy(&src_fingerprint, &route.dst_fp, ip.protocol, dst_port)?;
     push_flow_event(&src_fingerprint, &route.dst_fp, dst_port, decision, 1);
-
     if decision == 1 { Ok(()) } else { Err(-1) }
 }
 
