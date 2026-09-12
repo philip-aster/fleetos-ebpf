@@ -35,6 +35,16 @@ impl HostOrderPort {
     }
 }
 
+/// Socket cookie key (EBPF-CR-1). Kernel-generated, stable for the lifetime
+/// of the socket, and identical across cgroup/connect4 and sock_ops hooks for
+/// the same socket — unlike any 4-tuple (the connect4 rewrite mutates the
+/// destination, and the ephemeral source port is unassigned at connect time).
+/// Host-native value: no byte-order concern; the newtype exists for type
+/// distinctness from arbitrary u64s.
+#[repr(transparent)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
+pub struct SocketCookie(pub u64);
+
 // --- BPF Map Structs ---
 
 /// 40 bytes, 8-byte aligned. Used for exact policy matching.
@@ -78,16 +88,6 @@ pub struct FlowEvent {
     pub _pad: [u8; 4],                 // 4 bytes
 } // Total: 40 bytes
 
-/// 12 bytes. Key for the LRU_HASH storing original destination state.
-#[repr(C)]
-#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
-pub struct SockTuple {
-    pub src_ip: HostOrderIpv4,   // 4 bytes
-    pub dst_ip: HostOrderIpv4,   // 4 bytes
-    pub src_port: HostOrderPort, // 2 bytes
-    pub dst_port: HostOrderPort, // 2 bytes
-} // Total: 12 bytes
-
 // --- ER-1 REV1: Route Map Value (40 bytes, 8-byte aligned) ---
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
@@ -113,17 +113,19 @@ pub const STAT_DEFAULT_DENY_DROPS: u32 = 3;
 pub const STAT_ROUTE_MISSES: u32 = 4;
 pub const STAT_PASS_THROUGHS: u32 = 5;
 pub const STAT_REWRITES: u32 = 6;
-pub const STAT_RESERVED: u32 = 7;
+// Index 7 allocated by control (telemetry alignment, per Q5 ruling):
+// non-first overlay IP fragment drops, fail-closed, counted in both TC
+// directions.
+pub const STAT_FRAGMENT_DROPS: u32 = 7;
 
 // --- ER-4: ABI Layout Assertions ---
 const _: () = assert!(core::mem::size_of::<EbpfPolicyKey>() == 40);
 const _: () = assert!(core::mem::size_of::<EbpfPolicyWildcardKey>() == 32);
 const _: () = assert!(core::mem::size_of::<EbpfPolicyValue>() == 16);
 const _: () = assert!(core::mem::size_of::<FlowEvent>() == 40);
-const _: () = assert!(core::mem::size_of::<SockTuple>() == 12);
+const _: () = assert!(core::mem::size_of::<SocketCookie>() == 8);
 const _: () = assert!(core::mem::size_of::<DummyIpRouteValue>() == 40);
 const _: () = assert!(core::mem::size_of::<SockStateValue>() == 32);
-
 // Alignment is 2, not 1: HostOrderPort is #[repr(transparent)] over u16.
 const _: () = assert!(core::mem::align_of::<EbpfPolicyKey>() == 2);
 const _: () = assert!(core::mem::align_of::<DummyIpRouteValue>() == 8);

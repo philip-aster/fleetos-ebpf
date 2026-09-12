@@ -10,7 +10,7 @@ The kernel-level enforcement and routing plane for Fleet Orchestration System (F
 
 - **Production Target:** >= 5.15 LTS
 - **Hard Floor:** 5.8 (required for `BPF_MAP_TYPE_RINGBUF` used by `FLOW_EVENTS`)
-- **v0.1.3+ (Socket Cookie Keying):** Requires `bpf_get_socket_cookie` in `CGROUP_SOCK_ADDR` (~5.1) and `SK_MSG` (~5.2), both well below the 5.8 floor.
+- **Socket Cookie Keying (v0.1.3, landed):** Uses `bpf_get_socket_cookie` in `CGROUP_SOCK_ADDR` (~5.1) and `SK_MSG` (~5.2), both below the 5.8 floor.
 
 ## Workspace Structure
 
@@ -21,12 +21,13 @@ This repository is structured as a Cargo workspace to strictly separate kernel b
 
 ## eBPF Programs
 
-- **`cgroup_sock_addr` (Containerd Path):** Intercepts `connect()` syscalls. Resolves dummy IPs to destination identities, checks source identity, enforces two-tier AuthZ, and rewrites allowed connections to the local `fleetos-agent` loopback port.
-- **`tc_cls_act` (Cloud Hypervisor Path):** A TC classifier attached to host TAP devices. Enforces Two-Tier AuthZ policy (Exact -> Wildcard -> Deny) for MicroVMs. **As of v0.1.2-rc-2:** Parses TCP/UDP headers for port-aware EXACT-tier matching (parity with the containerd path) and drops non-first overlay IP fragments fail-closed to prevent port-DENY bypasses.
-- **`sock_ops` (Same-Node Bypass):** For same-node, Container-to-Container communication. Bypasses the agent and QUIC entirely by splicing sockets directly at the kernel level via `BPF_MAP_TYPE_SOCKHASH`.
-- **`FlowEvent` (Observability):** A ring buffer map that pushes flow logs (allow/deny, ingress/egress) for user-space telemetry export.
+- **`cgroup_sock_addr`** (Containerd Path): Intercepts `connect()` syscalls. Resolves dummy IPs to destination identities, checks source identity, enforces two-tier AuthZ, and rewrites allowed connections to the local `fleetos-agent` loopback port. Sock state keyed by **socket cookie** (v0.1.3, EBPF-CR-1).
+- **`tc_cls_act`** (Cloud Hypervisor Path): TC classifiers on host TAP devices. **Egress:** two-tier AuthZ with port-aware EXACT-tier matching (v0.1.2-rc-2) and non-first overlay fragment drops, fail-closed. **Ingress (v0.1.3, EBPF-CR-3):** boot-gated mirror of egress — overlay traffic drops until the agent arms `BOOT_GATE`, then fails closed through the same resolution chain.
+- **`sock_ops`** (Same-Node Bypass): Keys `SOCK_STATE_MAP` and `SOCKHASH` by socket cookie (v0.1.3). Publishes local-destined established sockets for zero-copy splicing.
+- **`sk_msg`** (Splice Redirect, v0.1.3, EBPF-CR-2): Redirects send-path traffic across same-node socket pairs via `SOCK_PEER_MAP` → `SOCKHASH`. Dormant until the M1 pairing mechanism lands. Attach alongside `SOCKHASH`.
+- **`FlowEvent`** (Observability): A ring buffer map that pushes flow logs (allow/deny, ingress/egress) for user-space telemetry export.
 
-## BPF Map Contracts (v0.1.2 REV1)
+## BPF Map Contracts (v0.1.3 REV1)
 
 The agent (`fleetos-agent`) is responsible for creating, sizing, and populating these maps before attaching the programs.
 
@@ -37,9 +38,11 @@ The agent (`fleetos-agent`) is responsible for creating, sizing, and populating 
 | `POLICY_EXACT` | `HASH` (8192) | `EbpfPolicyKey` (40B) | `EbpfPolicyValue` (16B) | Port/protocol-specific AuthZ rules. |
 | `POLICY_WILDCARD` | `HASH` (4096) | `EbpfPolicyWildcardKey` (32B)| `EbpfPolicyValue` (16B) | Port-agnostic AuthZ rules. |
 | `POLICY_STATS` | `ARRAY` (8) | `u32` | `u64` | Datapath counters (Allow, Deny, Rewrites, etc.). |
-| `SOCK_STATE_MAP` | `LRU_HASH` (4096) | `SockTuple` (12B) | `SockStateValue` (32B) | Stores Phase A resolution for the sock_ops fast-path. |
 | `LOCAL_WORKLOADS` | `HASH` (1024) | `IdentityFingerprint` | `bool` | Registry of local workloads for same-node bypass. |
-| `SOCKHASH` | `SOCKHASH` (4096) | `SockTuple` | `u64` (sk) | Socket map for `bpf_sock_hash_update` splicing. |
+| `SOCK_STATE_MAP` | `LRU_HASH` (4096) | `SocketCookie` (8B) | `SockStateValue` (32B) | Phase A resolution, keyed by socket cookie (EBPF-CR-1). |
+| `SOCKHASH` | `SOCKHASH` (4096) | `SocketCookie` (8B) | `u64` (sk) | Same-node splice endpoints (EBPF-CR-2). |
+| `SOCK_PEER_MAP` | `HASH` (4096) | `SocketCookie` | `SocketCookie` | Sender→peer cookie pairing. Dormant until the M1 joint spec with `fleetos-agent`. |
+| `BOOT_GATE` | `ARRAY` (1) | `u32` (0) | `u32` | Ingress boot gate. Agent arms after map population, before guest NIC up. |
 | `FLOW_EVENTS` | `RINGBUF` (1MB) | - | `FlowEvent` (40B) | Telemetry ring buffer. |
 
 *Note: Policy maps (`POLICY_EXACT`, `POLICY_WILDCARD`) MUST remain plain `HASH`. `LRU_HASH` is strictly prohibited for policy maps, as silent eviction of an Allow rule is an availability bug.*
