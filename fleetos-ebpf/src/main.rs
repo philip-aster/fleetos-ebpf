@@ -413,7 +413,9 @@ fn push_flow_event(
         direction,
         _pad: [0; 4],
     };
-    let _ = FLOW_EVENTS.output::<FlowEvent>(&event, 0);
+    if FLOW_EVENTS.output::<FlowEvent>(&event, 0).is_err() {
+        // Ring buffer full or no userspace consumer; telemetry dropped, datapath unaffected.
+    }
 }
 
 // --- Program 3: sock_ops (Same-Node Bypass) ---
@@ -456,10 +458,10 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<(), i64> {
 
     if is_local {
         // EBPF-CR-2: publish this endpoint for same-node splicing.
-        // Explicitly cast the raw context pointer to `*mut bpf_sock_ops`
-        // before taking a mutable reference to satisfy Aya's `BorrowMut` bound.
         let sk_ops = unsafe { &mut *(ctx.as_ptr() as *mut bpf_sock_ops) };
-        let _ = SOCKHASH.update(&mut cookie, sk_ops, 0);
+        if SOCKHASH.update(&mut cookie, sk_ops, 0).is_err() {
+            // Sockhash full or unavailable; splice disabled, falls back to agent path.
+        }
     }
     Ok(())
 }

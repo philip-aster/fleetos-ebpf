@@ -1,0 +1,18 @@
+[package]
+name = "fleetos-ebpf-smoketest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+authors = ["Philip Aster and the FleetOS Contributors"]
+description = "FleetOS eBPF Kernel Level Enforcement and Routing Plane"
+
+[dependencies]
+aya = "0.14.0"
+bytemuck.workspace = true
+fleetos-ebpf-common = { path = "../fleetos-ebpf-common" }
+
+
+[[test]]
+name = "counter_map"
+path = "tests/counter_map.rs"

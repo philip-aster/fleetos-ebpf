@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "fleetos-ebpf-common",
-    "fleetos-ebpf",
+    "fleetos-ebpf", "fleetos-ebpf-smoketest",
 ]
 
 [workspace.dependencies]
