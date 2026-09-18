@@ -16,15 +16,15 @@ use aya_ebpf::{
     },
     helpers::bpf_get_socket_cookie,
     macros::{cgroup_sock_addr, classifier, map, sk_msg, sock_ops},
-    maps::{Array, HashMap, LruHashMap, RingBuf, SockHash},
+    maps::{Array, HashMap, LruHashMap, PerCpuHashMap, RingBuf, SockHash},
     programs::{SkMsgContext, SockAddrContext, SockOpsContext, TcContext},
 };
 use core::mem::size_of;
 use fleetos_ebpf_common::{
     DummyIpRouteValue, EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, FlowEvent,
-    HostOrderIpv4, HostOrderPort, IdentityFingerprint, STAT_ALLOW_HITS, STAT_DEFAULT_DENY_DROPS,
-    STAT_DENY_HITS, STAT_FRAGMENT_DROPS, STAT_PASS_THROUGHS, STAT_REWRITES, STAT_ROUTE_MISSES,
-    STAT_WILDCARD_HITS, SockStateValue, SocketCookie,
+    HostOrderIpv4, HostOrderPort, IdentityFingerprint, PodNetCounters, STAT_ALLOW_HITS,
+    STAT_DEFAULT_DENY_DROPS, STAT_DENY_HITS, STAT_FRAGMENT_DROPS, STAT_PASS_THROUGHS,
+    STAT_REWRITES, STAT_ROUTE_MISSES, STAT_WILDCARD_HITS, SockStateValue, SocketCookie,
 };
 
 // sk_msg verdict codes (kernel enum sk_action).
@@ -86,6 +86,14 @@ static SOCK_PEER_MAP: HashMap<SocketCookie, SocketCookie> = HashMap::pinned(4096
 #[map]
 static BOOT_GATE: Array<u32> = Array::pinned(1, 0);
 
+// EBPF-CR-5: per-pod cumulative network counters for autoscaling (CR-CTRL-8)
+// and observability. PERCPU: each CPU writes its own slot — no cache-line
+// contention on the packet path. Agent sums across CPUs when reading.
+// Keyed by workload IP (same key space as SRC_IDENTITY_MAP).
+#[map]
+static POD_NET_COUNTERS: PerCpuHashMap<HostOrderIpv4, PodNetCounters> =
+    PerCpuHashMap::pinned(4096, 0);
+
 // --- Program 1: cgroup_sock_addr (Containerd Path - Transparent Dialing) ---
 
 #[cgroup_sock_addr(connect4)]
@@ -100,6 +108,29 @@ pub fn fleetos_connect4(ctx: SockAddrContext) -> i32 {
 fn bump_stat(index: u32) {
     if let Some(ptr) = { POLICY_STATS.get_ptr_mut(index) } {
         unsafe { *ptr += 1 };
+    }
+}
+
+/// EBPF-CR-5: accumulate byte/packet counters for allowed overlay traffic.
+/// Egress keys on src_ip (the sending workload); ingress keys on dst_ip
+/// (the receiving workload). Both match SRC_IDENTITY_MAP's key space, so
+/// the agent pre-populates entries at the same time it populates identity.
+///
+/// Entry missing = workload IP not yet registered by the agent. Counters
+/// are observability, not enforcement: skip silently (never block traffic
+/// for a missing counter entry).
+#[inline(always)]
+fn bump_net_counters(ip: &HostOrderIpv4, tx: bool, bytes: u32) {
+    if let Some(counters) = { POD_NET_COUNTERS.get_ptr_mut(ip) } {
+        unsafe {
+            if tx {
+                (*counters).tx_bytes += bytes as u64;
+                (*counters).tx_packets += 1;
+            } else {
+                (*counters).rx_bytes += bytes as u64;
+                (*counters).rx_packets += 1;
+            }
+        }
     }
 }
 
@@ -245,6 +276,12 @@ fn try_tc_egress(ctx: &TcContext) -> Result<(), i64> {
 
     let dst_port = parse_dst_port(&ip, data, data_end, eth_len)?;
     let decision = check_policy(&src_fingerprint, &route.dst_fp, ip.protocol, dst_port)?;
+    if decision == 1 {
+        // EBPF-CR-5: count egress bytes for autoscaling/observability.
+        // Only allowed traffic is counted — denied packets don't flow,
+        // so they don't consume resources the autoscaler should react to.
+        bump_net_counters(&src_ip_ho, true, unsafe { (*skb).len });
+    }
     push_flow_event(&src_fingerprint, &route.dst_fp, dst_port, decision, 1);
     if decision == 1 { Ok(()) } else { Err(-1) }
 }
@@ -309,6 +346,11 @@ fn try_tc_ingress(ctx: &TcContext) -> Result<(), i64> {
 
     let dst_port = parse_dst_port(&ip, data, data_end, eth_len)?;
     let decision = check_policy(&src_fingerprint, &route.dst_fp, ip.protocol, dst_port)?;
+    if decision == 1 {
+        // EBPF-CR-5: count ingress bytes for autoscaling/observability.
+        // Keyed on dst_ip: the receiving workload.
+        bump_net_counters(&dst_ip_ho, false, unsafe { (*skb).len });
+    }
     push_flow_event(&src_fingerprint, &route.dst_fp, dst_port, decision, 0);
     if decision == 1 { Ok(()) } else { Err(-1) }
 }

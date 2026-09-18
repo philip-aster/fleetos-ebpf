@@ -105,6 +105,24 @@ pub struct SockStateValue {
     pub target_agent_fp: IdentityFingerprint,
 } // Total: 32 bytes
 
+/// 32 bytes. Per-pod cumulative network counters (EBPF-CR-5).
+/// Incremented in the TC datapath for allowed overlay traffic only.
+/// Agent reads periodically, diffs consecutive reads, divides by the
+/// interval, and reports per-second rates to control via PodMetrics
+/// (CR-CORE-9 / CR-CTRL-8 net-metric unit contract).
+///
+/// Coverage: TAP/MicroVM path only. Containerd-path traffic is proxied
+/// through the agent (which accounts its own bytes); the agent merges
+/// both sources before reporting.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
+pub struct PodNetCounters {
+    pub tx_bytes: u64,   // 8 bytes — cumulative egress bytes
+    pub tx_packets: u64, // 8 bytes — cumulative egress packets
+    pub rx_bytes: u64,   // 8 bytes — cumulative ingress bytes
+    pub rx_packets: u64, // 8 bytes — cumulative ingress packets
+} // Total: 32 bytes
+
 // --- ER-2 REV1: policy_stats normative enumeration ---
 pub const STAT_ALLOW_HITS: u32 = 0;
 pub const STAT_DENY_HITS: u32 = 1;
@@ -126,6 +144,7 @@ const _: () = assert!(core::mem::size_of::<FlowEvent>() == 40);
 const _: () = assert!(core::mem::size_of::<SocketCookie>() == 8);
 const _: () = assert!(core::mem::size_of::<DummyIpRouteValue>() == 40);
 const _: () = assert!(core::mem::size_of::<SockStateValue>() == 32);
+const _: () = assert!(core::mem::size_of::<PodNetCounters>() == 32);
 // Alignment is 2, not 1: HostOrderPort is #[repr(transparent)] over u16.
 const _: () = assert!(core::mem::align_of::<EbpfPolicyKey>() == 2);
 const _: () = assert!(core::mem::align_of::<DummyIpRouteValue>() == 8);
